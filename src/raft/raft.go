@@ -412,20 +412,18 @@ func (rf *Raft) heartbeatThread() {
 	for atomic.LoadInt32(&rf.dead) != 1 {
 		time.Sleep(time.Millisecond * time.Duration(HeartBeatInterval))
 		rf.mu.Lock()
-		if rf.currentState == Leader {
-			term := rf.currentTerm
-			rf.mu.Unlock()
+		state := rf.currentState
+		term := rf.currentTerm
+		rf.mu.Unlock()
 
+		if state == Leader {
 			for idx, _ := range rf.peers {
 				if idx == rf.me {
 					continue
 				}
 
-				rf.sendHeartBeatPackage(idx, term)
+				go rf.sendHeartBeatPackage(idx, term)
 			}
-
-		} else {
-			rf.mu.Unlock()
 		}
 	}
 }
