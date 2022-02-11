@@ -33,8 +33,8 @@ const (
 )
 
 const (
-	ElectionLowerBound int = 450
-	ElectionUpperBound int = 600
+	ElectionLowerBound int = 1000
+	ElectionUpperBound int = 2000
 )
 
 const HeartBeatInterval int = 150
@@ -56,6 +56,11 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Log struct {
+	command		interface{}
+	term		int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -71,10 +76,19 @@ type Raft struct {
 	// state a Raft server must maintain.
 	votedFor   			int
 	currentTerm			int
+	log					[]Log
+
+	// for election
 	leaderId   			int
 	currentState		int
 	election_timer   	time.Time
 	heartbeat_timer		time.Time
+
+	// for log
+	commitIndex			int
+	lastApplied			int
+	nextIndex			[]int
+	matchIndex			[]int
 }
 
 // return currentTerm and whether this server
@@ -137,7 +151,7 @@ type AppendEntriesArgs struct {
 	LeaderId		int
 	PrevLogIndex	int
 	PrevLogTerm		int
-	Entries			[]int
+	Entries			[]interface{}
 	LeaderCommit	int
 }
 
@@ -155,6 +169,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 	} else {
 		rf.election_timer = time.Now()
+		// DPrintf("[%d] receive heart beat packet from %d term %d curTime=%v", rf.me, args.LeaderId, args.Term, rf.election_timer)
 		rf.leaderId = args.LeaderId
 		rf.currentTerm = args.Term
 		if rf.currentState != Follower {
@@ -199,7 +214,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("[%d] get RequestVote RPC from %d currentState=%v", rf.me, args.CandidateId, rf.currentState)
+	DPrintf("[%d] get RequestVote RPC from %d currentState=%v term=%v", rf.me, args.CandidateId, rf.currentState, args.Term)
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -282,7 +297,6 @@ func (rf *Raft) startNewElection() {
 	// vote for self
 	rf.votedFor = rf.me
 	rf.currentState = Candidate
-	rf.election_timer = time.Now()
 
 	counter := 1
 
@@ -318,7 +332,18 @@ func (rf *Raft) startNewElection() {
 			done = true
 			if term == rf.currentTerm {
 				rf.currentState = Leader
+
+				go rf.sendAllHeartBeatPackage(rf.currentTerm)
+				rf.heartbeat_timer = time.Now()
+
 				DPrintf("[%d] Wins to be a leader at term %d", rf.me, term)
+				// reinitialized the leader state
+				rf.nextIndex = make([]int, len(rf.peers))
+				rf.matchIndex = make([]int, len(rf.peers))
+				for i := 0; i < len(rf.peers); i++ {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = 0
+				}
 			}
 		}(idx)
 	}
@@ -329,6 +354,33 @@ func (rf *Raft) getMajority() int {
 	return len(rf.peers) / 2 + 1
 }
 
+
+func (rf *Raft) startAppendEntries(term int, index int) {
+	rf.mu.Lock()
+	args := AppendEntriesArgs{}
+	args.Term = term
+	args.LeaderId = rf.me
+	args.PrevLogIndex = index - 1
+	args.PrevLogTerm = rf.log[index - 1].term
+	args.Entries = make([]interface{}, 1)
+	args.Entries[0] = rf.log[index].command
+	args.LeaderCommit = rf.commitIndex
+	rf.mu.Unlock()
+
+	for idx := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			if !ok {
+				return
+			}
+
+		}(idx)
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -350,7 +402,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.currentState != Leader {
+		isLeader = false
+		return index, term, isLeader
+	}
 
+	term = rf.currentTerm
+	index = len(rf.log)
+	new_entry := Log{ command: command, term: term }
+	rf.log = append(rf.log, new_entry)
+
+	go rf.startAppendEntries(term, index)
 
 	return index, term, isLeader
 }
@@ -408,23 +472,27 @@ func (rf *Raft) sendHeartBeatPackage(server int, term int) {
 	}
 }
 
+func (rf *Raft) sendAllHeartBeatPackage(term int) {
+	for idx, _ := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+
+		go rf.sendHeartBeatPackage(idx, term)
+	}
+}
+
 func (rf *Raft) heartbeatThread() {
 	for atomic.LoadInt32(&rf.dead) != 1 {
-		time.Sleep(time.Millisecond * time.Duration(HeartBeatInterval))
+		// DO NOT EVER MULTIPLY DURATION WITH DURATION
+		interval := time.Duration(HeartBeatInterval)
+		time.Sleep(time.Millisecond * interval)
 		rf.mu.Lock()
-		state := rf.currentState
-		term := rf.currentTerm
-		rf.mu.Unlock()
-
-		if state == Leader {
-			for idx, _ := range rf.peers {
-				if idx == rf.me {
-					continue
-				}
-
-				go rf.sendHeartBeatPackage(idx, term)
-			}
+		if time.Now().Sub(rf.heartbeat_timer) > time.Millisecond * interval && rf.currentState == Leader {
+			go rf.sendAllHeartBeatPackage(rf.currentTerm)
+			rf.heartbeat_timer = time.Now()
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -452,6 +520,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentState = Follower
 	rf.election_timer = time.Now()
 	rf.heartbeat_timer = time.Now()
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.log = make([]Log, 1)
 
 	go rf.heartbeatThread()
 	go rf.electionThread()
